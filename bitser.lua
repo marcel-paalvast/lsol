@@ -23,7 +23,6 @@ local insert = table.insert
 local getmetatable = getmetatable
 local setmetatable = setmetatable
 
-local ffi = require("ffi")
 local buf_pos = 0
 local buf_size = -1
 local buf = nil
@@ -36,7 +35,7 @@ local SEEN_LEN = {}
 local function Buffer_prereserve(min_size)
 	if buf_size < min_size then
 		buf_size = min_size
-		buf = ffi.new("uint8_t[?]", buf_size)
+		buf = {}
 		buf_is_writable = true
 	end
 end
@@ -63,7 +62,9 @@ end
 
 local function Buffer_newReader(str)
 	Buffer_makeBuffer(#str)
-	ffi.copy(buf, str, #str)
+	for i = 1, #str do
+		buf[i] = string.byte(str, i)
+	end
 end
 
 local function Buffer_newDataReader(data, size)
@@ -74,28 +75,34 @@ local function Buffer_newDataReader(data, size)
 	buf_is_writable = false
 	buf_pos = 0
 	buf_size = size
-	buf = ffi.cast("uint8_t*", data)
+	buf = {}
+	for i = 1, size do
+		buf[i] = data:byte(i)
+	end
 end
 
 local function Buffer_reserve(additional_size)
 	while buf_pos + additional_size > buf_size do
 		buf_size = buf_size * 2
 		local oldbuf = buf
-		buf = ffi.new("uint8_t[?]", buf_size)
-		buf_is_writable = true
-		ffi.copy(buf, oldbuf, buf_pos)
+		buf = {}
+		for i = 1, buf_pos do
+			buf[i] = oldbuf[i]
+		end
 	end
 end
 
 local function Buffer_write_byte(x)
 	Buffer_reserve(1)
-	buf[buf_pos] = x
+	buf[buf_pos + 1] = x
 	buf_pos = buf_pos + 1
 end
 
 local function Buffer_write_raw(data, len)
 	Buffer_reserve(len)
-	ffi.copy(buf + buf_pos, data, len)
+	for i = 1, len do
+		buf[buf_pos + i] = data:byte(i)
+	end
 	buf_pos = buf_pos + len
 end
 
@@ -104,7 +111,8 @@ local function Buffer_write_string(s)
 end
 
 local function Buffer_write_data(ct, len, ...)
-	Buffer_write_raw(ffi.new(ct, ...), len)
+	local data = string.pack(ct, ...)
+	Buffer_write_raw(data, len)
 end
 
 local function Buffer_ensure(numbytes)
@@ -115,26 +123,30 @@ end
 
 local function Buffer_read_byte()
 	Buffer_ensure(1)
-	local x = buf[buf_pos]
+	local x = buf[buf_pos + 1]
 	buf_pos = buf_pos + 1
 	return x
 end
 
 local function Buffer_read_string(len)
 	Buffer_ensure(len)
-	local x = ffi.string(buf + buf_pos, len)
+	local x = string.char(table.unpack(buf, buf_pos + 1, buf_pos + len))
 	buf_pos = buf_pos + len
 	return x
 end
 
 local function Buffer_read_raw(data, len)
-	ffi.copy(data, buf + buf_pos, len)
+	for i = 1, len do
+		data[i] = buf[buf_pos + i]
+	end
 	buf_pos = buf_pos + len
 	return data
 end
 
 local function Buffer_read_data(ct, len)
-	return Buffer_read_raw(ffi.new(ct), len)
+	local data = {}
+	Buffer_read_raw(data, len)
+	return string.unpack(ct, string.char(table.unpack(data)))
 end
 
 local resource_registry = {}
@@ -154,16 +166,16 @@ local function write_number(value, _)
 		elseif value >= -32768 and value <= 32767 then
 			--short int
 			Buffer_write_byte(250)
-			Buffer_write_data("int16_t[1]", 2, value)
+			Buffer_write_data("i2", 2, value)
 		else
 			--long int
 			Buffer_write_byte(245)
-			Buffer_write_data("int32_t[1]", 4, value)
+			Buffer_write_data("i4", 4, value)
 		end
 	else
 		--double
 		Buffer_write_byte(246)
-		Buffer_write_data("double[1]", 8, value)
+		Buffer_write_data("d", 8, value)
 	end
 end
 
@@ -227,23 +239,7 @@ local function write_table(value, seen)
 	end
 end
 
-local function write_cdata(value, seen)
-	local ty = ffi.typeof(value)
-	if ty == value then
-		-- ctype
-		Buffer_write_byte(251)
-		serialize_value(tostring(ty):sub(7, -2), seen)
-		return
-	end
-	-- cdata
-	Buffer_write_byte(252)
-	serialize_value(ty, seen)
-	local len = ffi.sizeof(value)
-	write_number(len)
-	Buffer_write_raw(ffi.typeof('$[1]', ty)(value), len)
-end
-
-local types = {number = write_number, string = write_string, table = write_table, boolean = write_boolean, ["nil"] = write_nil, cdata = write_cdata}
+local types = {number = write_number, string = write_string, table = write_table, boolean = write_boolean, ["nil"] = write_nil}
 
 serialize_value = function(value, seen)
 	if seen[value] then
@@ -259,7 +255,7 @@ serialize_value = function(value, seen)
 		return
 	end
 	local t = type(value)
-	if t ~= 'number' and t ~= 'boolean' and t ~= 'nil' and t ~= 'cdata' then
+	if t ~= 'number' and t ~= 'boolean' and t ~= 'nil' then
 		seen[value] = seen[SEEN_LEN]
 		seen[SEEN_LEN] = seen[SEEN_LEN] + 1
 	end
@@ -363,10 +359,10 @@ local function deserialize_value(seen)
 		return add_to_seen(Buffer_read_string(deserialize_value(seen)), seen)
 	elseif t == 245 then
 		--long int
-		return Buffer_read_data("int32_t[1]", 4)[0]
+		return Buffer_read_data("i4", 4)
 	elseif t == 246 then
 		--double
-		return Buffer_read_data("double[1]", 8)[0]
+		return Buffer_read_data("d", 8)
 	elseif t == 247 then
 		--nil
 		return nil
@@ -378,16 +374,7 @@ local function deserialize_value(seen)
 		return true
 	elseif t == 250 then
 		--short int
-		return Buffer_read_data("int16_t[1]", 2)[0]
-	elseif t == 251 then
-		--ctype
-		return ffi.typeof(deserialize_value(seen))
-	elseif t == 252 then
-		local ctype = deserialize_value(seen)
-		local len = deserialize_value(seen)
-		local read_into = ffi.typeof('$[1]', ctype)()
-		Buffer_read_raw(read_into, len)
-		return ctype(read_into[0])
+		return Buffer_read_data("i2", 2)
 	else
 		error("unsupported serialized type " .. t)
 	end
@@ -413,14 +400,14 @@ end
 
 return {dumps = function(value)
 	serialize(value)
-	return ffi.string(buf, buf_pos)
+	return string.char(table.unpack(buf, 1, buf_pos))
 end, dumpLoveFile = function(fname, value)
 	serialize(value)
-	assert(love.filesystem.write(fname, ffi.string(buf, buf_pos)))
+	assert(love.filesystem.write(fname, string.char(table.unpack(buf, 1, buf_pos))))
 end, loadLoveFile = function(fname)
 	local serializedData, error = love.filesystem.newFileData(fname)
 	assert(serializedData, error)
-	Buffer_newDataReader(serializedData:getPointer(), serializedData:getSize())
+	Buffer_newDataReader(serializedData:getString(), serializedData:getSize())
 	local value = deserialize_value({})
 	-- serializedData needs to not be collected early in a tail-call
 	-- so make sure deserialize_value returns before loadLoveFile does
